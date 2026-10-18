@@ -224,3 +224,187 @@ async def test_get_page_returns_the_hash_the_update_expects(
     )
 
     stub_client.webdav.write_file.assert_awaited_once()
+
+
+# --- Releasing the Text editor's lock (COLLECTIVES_RELEASE_EDITOR_LOCK) ------
+#
+# Text locks a page whenever an editor view is open, preview included, and
+# leaks the lock when a tab dies (nextcloud/text#9042). With the setting on,
+# only that lock is released, the content is re-read and hash-checked, and the
+# write is conditional on the etag read after the release (releasing changes
+# it). A person's lock and every content conflict are still refused.
+
+TEXT_LOCK = {"file_id": 42, "owner_type": 1, "editor": "text"}
+
+
+@pytest.fixture
+def release_enabled(mocker):
+    return mocker.patch(
+        "nextcloud_mcp_server.server.collectives.cfg_bool", return_value=True
+    )
+
+
+@pytest.fixture
+def editor_locked(stub_client, mocker):
+    stub_client.webdav.write_file.side_effect = [
+        {"status_code": 423},
+        {"status_code": 204, "etag": "etag-c"},
+    ]
+    stub_client.webdav.get_lock = mocker.AsyncMock(return_value=TEXT_LOCK)
+    stub_client.webdav.release_lock = mocker.AsyncMock(return_value=True)
+    stub_client.webdav.read_file.side_effect = [
+        (CURRENT, "text/markdown", "etag-a"),
+        (CURRENT, "text/markdown", "etag-after-release"),
+    ]
+    return stub_client
+
+
+async def test_editor_lock_is_refused_when_release_is_off(
+    collectives_tools, editor_locked, mocker
+):
+    mocker.patch("nextcloud_mcp_server.server.collectives.cfg_bool", return_value=False)
+
+    with pytest.raises(ToolError) as exc_info:
+        await _update(collectives_tools, mocker)
+
+    assert "locked" in str(exc_info.value)
+    editor_locked.webdav.get_lock.assert_not_awaited()
+    editor_locked.webdav.release_lock.assert_not_awaited()
+
+
+async def test_editor_lock_is_released_and_the_page_written(
+    collectives_tools, editor_locked, release_enabled, mocker
+):
+    result = await _update(collectives_tools, mocker)
+
+    editor_locked.webdav.release_lock.assert_awaited_once_with(42)
+    retry = editor_locked.webdav.write_file.await_args_list[1]
+    assert retry.kwargs["if_match"] == "etag-after-release"
+    assert result.etag == "etag-c"
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        {"file_id": 42, "owner_type": 0, "editor": None},
+        {"file_id": 42, "owner_type": 1, "editor": "richdocuments"},
+        {"file_id": 42, "owner_type": 2, "editor": None},
+    ],
+    ids=["person", "other-app", "token"],
+)
+async def test_only_the_text_editors_lock_is_released(
+    collectives_tools, editor_locked, release_enabled, mocker, lock
+):
+    """A person's lock, another app's lock (e.g. Collabora) and a token lock
+    are refused as locked, never released."""
+    editor_locked.webdav.get_lock.return_value = lock
+
+    with pytest.raises(ToolError) as exc_info:
+        await _update(collectives_tools, mocker)
+
+    assert "locked" in str(exc_info.value)
+    editor_locked.webdav.release_lock.assert_not_awaited()
+    assert editor_locked.webdav.write_file.await_count == 1
+
+
+async def test_refused_release_writes_nothing(
+    collectives_tools, editor_locked, release_enabled, mocker
+):
+    editor_locked.webdav.release_lock.return_value = False
+
+    with pytest.raises(ToolError) as exc_info:
+        await _update(collectives_tools, mocker)
+
+    assert "may not release" in str(exc_info.value)
+    assert editor_locked.webdav.write_file.await_count == 1
+
+
+async def test_content_changed_in_the_editor_is_still_a_conflict(
+    collectives_tools, editor_locked, release_enabled, mocker
+):
+    """Someone's typing reached the file before the release: the hash check
+    refuses the write, exactly as without a lock."""
+    editor_locked.webdav.read_file.side_effect = [
+        (CURRENT, "text/markdown", "etag-a"),
+        (CURRENT + b"typed\n", "text/markdown", "etag-after-release"),
+    ]
+
+    with pytest.raises(ToolError) as exc_info:
+        await _update(collectives_tools, mocker)
+
+    assert "changed since it was read" in str(exc_info.value)
+    assert editor_locked.webdav.write_file.await_count == 1
+
+
+async def test_editor_relocking_gives_up_after_one_more_round(
+    collectives_tools, editor_locked, release_enabled, mocker
+):
+    editor_locked.webdav.write_file.side_effect = [{"status_code": 423}] * 3
+    editor_locked.webdav.read_file.side_effect = [
+        (CURRENT, "text/markdown", "etag-a")
+    ] * 3
+
+    with pytest.raises(ToolError) as exc_info:
+        await _update(collectives_tools, mocker)
+
+    assert "locked" in str(exc_info.value)
+    assert editor_locked.webdav.release_lock.await_count == 2
+    assert editor_locked.webdav.write_file.await_count == 3
+
+
+async def test_lock_gone_by_then_is_just_rewritten(
+    collectives_tools, editor_locked, release_enabled, mocker
+):
+    editor_locked.webdav.get_lock.return_value = None
+
+    await _update(collectives_tools, mocker)
+
+    editor_locked.webdav.release_lock.assert_not_awaited()
+    assert editor_locked.webdav.write_file.await_count == 2
+
+
+async def test_etag_changed_by_a_lock_is_written_after_the_content_check(
+    collectives_tools, editor_locked, release_enabled, mocker
+):
+    """Opening the page in the editor after it was read takes a lock, which
+    changes the etag: the first write fails If-Match (412) although the
+    content is unchanged. The content hash decides, and the write goes ahead."""
+    editor_locked.webdav.write_file.side_effect = [
+        {"status_code": 412},
+        {"status_code": 204, "etag": "etag-c"},
+    ]
+
+    result = await _update(collectives_tools, mocker)
+
+    editor_locked.webdav.release_lock.assert_awaited_once_with(42)
+    assert result.etag == "etag-c"
+
+
+async def test_412_with_changed_content_stays_a_conflict(
+    collectives_tools, editor_locked, release_enabled, mocker
+):
+    editor_locked.webdav.write_file.side_effect = [{"status_code": 412}]
+    editor_locked.webdav.get_lock.return_value = None
+    editor_locked.webdav.read_file.side_effect = [
+        (CURRENT, "text/markdown", "etag-a"),
+        (CURRENT + b"someone else\n", "text/markdown", "etag-b"),
+    ]
+
+    with pytest.raises(ToolError) as exc_info:
+        await _update(collectives_tools, mocker)
+
+    assert "changed since it was read" in str(exc_info.value)
+    assert editor_locked.webdav.write_file.await_count == 1
+
+
+async def test_412_without_the_setting_is_a_conflict(
+    collectives_tools, editor_locked, mocker
+):
+    mocker.patch("nextcloud_mcp_server.server.collectives.cfg_bool", return_value=False)
+    editor_locked.webdav.write_file.side_effect = [{"status_code": 412}]
+
+    with pytest.raises(ToolError) as exc_info:
+        await _update(collectives_tools, mocker)
+
+    assert "changed since it was read" in str(exc_info.value)
+    editor_locked.webdav.get_lock.assert_not_awaited()

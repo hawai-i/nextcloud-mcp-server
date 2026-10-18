@@ -353,6 +353,15 @@ _DEFAULTS: dict[str, Any] = {
     # timing out or exhausting memory rather than failing predictably. 0
     # disables the guard.
     "webdav_write_max_mb": 50.0,
+    # Let collectives_update_page_content release the Text editor's session
+    # lock (files_lock, owner app "text") instead of refusing with "locked".
+    # Text locks a page for as long as any editor view is open, preview
+    # included, and leaks the lock when a tab dies (nextcloud/text#9042), so
+    # without this a page can stay unwritable indefinitely. The content-hash
+    # check still guards the write. Off by default. Read via cfg_bool(), not a
+    # Settings field, like mcp_disable_capability_gating: only the one tool
+    # looks at it.
+    "collectives_release_editor_lock": False,
     # Transport security (MCP SDK TransportSecuritySettings). Default False
     # preserves the behaviour hardcoded before these knobs existed: MCP 1.23+
     # auto-enables localhost-only host checking, which breaks k8s/Docker service

@@ -19,6 +19,7 @@ from nextcloud_mcp_server.observability.metrics import (
 
 from .base import BaseNextcloudClient
 from .dav_urls import encode_dav_path
+from .ocs import OCS_REQUEST_HEADERS
 
 logger = logging.getLogger(__name__)
 
@@ -2042,6 +2043,66 @@ class WebDAVClient(BaseNextcloudClient):
                 if text:
                     return text
         return None
+
+    async def get_lock(self, path: str) -> dict[str, Any] | None:
+        """Return the files_lock lock on ``path``, or None if it is not locked.
+
+        A Depth-0 ``PROPFIND`` for the ``nc:lock*`` properties files_lock
+        publishes. The result carries ``file_id``, ``owner_type`` (0 user,
+        1 app, 2 token, as ``ILock::TYPE_*``) and ``editor`` (the app id for an
+        app lock, e.g. ``text`` for the Text editor's session lock), so a
+        caller can tell an editor's session lock from a lock a person set.
+        """
+        await self._ensure_principal_id()
+        webdav_path = self._webdav_path(path)
+        propfind_body = (
+            '<?xml version="1.0"?>'
+            '<d:propfind xmlns:d="DAV:" xmlns:nc="http://nextcloud.org/ns"'
+            ' xmlns:oc="http://owncloud.org/ns">'
+            "<d:prop><nc:lock/><nc:lock-owner-type/><nc:lock-owner-editor/>"
+            "<oc:fileid/></d:prop></d:propfind>"
+        )
+        headers = {"Depth": "0", "Content-Type": "text/xml", "OCS-APIRequest": "true"}
+        response = await self._make_request(
+            "PROPFIND", webdav_path, content=propfind_body, headers=headers
+        )
+        props: dict[str, str] = {}
+        for elem in ET.fromstring(response.content).iter():
+            if isinstance(elem.tag, str):
+                name = elem.tag.rsplit("}", 1)[-1]
+                if name in {"lock", "lock-owner-type", "lock-owner-editor", "fileid"}:
+                    props.setdefault(name, (elem.text or "").strip())
+        if props.get("lock") != "1":
+            return None
+        owner_type = props.get("lock-owner-type", "")
+        file_id = props.get("fileid", "")
+        return {
+            "file_id": int(file_id) if file_id.isdigit() else None,
+            "owner_type": int(owner_type) if owner_type.isdigit() else None,
+            "editor": props.get("lock-owner-editor") or None,
+        }
+
+    async def release_lock(self, file_id: int) -> bool:
+        """Release the files_lock lock on a file through the files_lock OCS API.
+
+        files_lock lets the file's owner release any lock on it, including an
+        app lock such as the Text editor's. Returns True when the file is
+        unlocked afterwards (released now, or there was no lock: 412), False
+        when files_lock refuses because this user may not release it (423).
+        """
+        try:
+            await self._make_request(
+                "DELETE",
+                f"/ocs/v2.php/apps/files_lock/lock/{file_id}",
+                headers=dict(OCS_REQUEST_HEADERS),
+            )
+        except HTTPStatusError as e:
+            if e.response.status_code == 412:
+                return True
+            if e.response.status_code == 423:
+                return False
+            raise
+        return True
 
     async def list_comments(
         self, file_id: int, *, limit: int = 20, offset: int = 0

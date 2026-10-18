@@ -3,7 +3,7 @@
 import hashlib
 import logging
 import re
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from httpx import HTTPStatusError
 from mcp.server.mcpserver import Context, MCPServer
@@ -13,7 +13,7 @@ from mcp.types import ToolAnnotations
 
 from nextcloud_mcp_server.auth import require_scopes
 from nextcloud_mcp_server.client.collectives import OCSError
-from nextcloud_mcp_server.config import get_settings
+from nextcloud_mcp_server.config import cfg_bool, get_settings
 from nextcloud_mcp_server.context import get_client
 from nextcloud_mcp_server.models.collectives import (
     Collective,
@@ -61,6 +61,71 @@ def _page_webdav_path(page: PageInfo) -> str | None:
 
 def _content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+# files_lock ``ILock::TYPE_APP`` and the app id the Text editor locks under.
+_LOCK_TYPE_APP = 1
+_TEXT_EDITOR_APP = "text"
+
+
+def _locked_error(page_id: int) -> ToolError:
+    return ToolError(
+        f"Page {page_id} is locked by another client (e.g. open in an editor "
+        "with file locking enabled). Nothing was written. Try again later."
+    )
+
+
+async def _write_through_editor_lock(
+    webdav: Any,
+    path: str,
+    page_id: int,
+    content_bytes: bytes,
+    expected_hash: str,
+    conflict: str,
+) -> dict[str, Any]:
+    """Write a page that the Text editor holds locked, or whose etag it changed.
+
+    Text takes a files_lock app lock whenever an editor view of the page is
+    open, preview included, and only releases it on a clean close, so a closed
+    tab can leave it behind for good (nextcloud/text#9042). Only that lock is
+    released here. A lock a person set stays respected. Releasing a lock
+    changes the file's etag, and so does taking one, so the caller's etag can
+    no longer match: the current content is re-read and the content hash
+    decides instead, followed by a write conditional on the fresh etag.
+    """
+    for _attempt in range(2):
+        # The content matched moments ago (checked before the first write), so
+        # the lock is released before the re-read. If the page changes in that
+        # window the hash below still refuses the write, the editor has merely
+        # lost a lock it would retake on its next save.
+        lock = await webdav.get_lock(path)
+        if lock is not None:
+            if (lock["owner_type"], lock["editor"]) != (
+                _LOCK_TYPE_APP,
+                _TEXT_EDITOR_APP,
+            ):
+                raise _locked_error(page_id)
+            if not await webdav.release_lock(lock["file_id"] or page_id):
+                raise ToolError(
+                    f"Page {page_id} is open in the Nextcloud editor and this "
+                    "user may not release the editor's lock. Nothing was "
+                    "written. Close the page in Nextcloud and try again."
+                )
+            logger.info("Released the Text editor lock on page %s", page_id)
+
+        current_bytes, _, fresh_etag = await webdav.read_file(path)
+        if _content_hash(current_bytes) != expected_hash:
+            raise ToolError(conflict)
+        result = await webdav.write_file(
+            path, content_bytes, "text/markdown", if_match=fresh_etag
+        )
+        if result.get("status_code") == 412:
+            raise ToolError(conflict)
+        if result.get("status_code") != 423:
+            return result
+        # An open editor takes its lock again right after a release. One
+        # more round, then give up.
+    raise _locked_error(page_id)
 
 
 def _raise_collectives_error(e: OCSError | HTTPStatusError) -> NoReturn:
@@ -483,9 +548,18 @@ def configure_collectives_tools(mcp: MCPServer):
 
         The page's earlier content stays available in its version history.
 
+        The Nextcloud editor locks a page while it is open, even in preview.
+        If the server sets ``COLLECTIVES_RELEASE_EDITOR_LOCK``, that editor
+        lock is released and the page is written after the same content
+        check. An open preview then shows the new content. Someone typing in
+        the editor at that moment is asked which version to keep, and the
+        other one stays in the version history. A lock a person set is always
+        respected.
+
         Raises ``ToolError`` when the page changed since it was read, when it
         is locked by another client (e.g. open in an editor with file locking
-        enabled), when ``EXCLUDED_TAGS`` is configured and the page's file
+        enabled, unless the editor lock may be released as above), when
+        ``EXCLUDED_TAGS`` is configured and the page's file
         carries an excluded tag, or when the content exceeds
         ``WEBDAV_WRITE_MAX_MB``.
 
@@ -562,14 +636,19 @@ def configure_collectives_tools(mcp: MCPServer):
         )
         # write_file returns (rather than raises) on 412/423.
         status_code = result.get("status_code")
-        if status_code == 412:
-            raise ToolError(conflict)
-        if status_code == 423:
-            raise ToolError(
-                f"Page {page_id} is locked by another client (e.g. open in an "
-                "editor with file locking enabled). Nothing was written. Try "
-                "again later."
+        if status_code in (412, 423) and cfg_bool("COLLECTIVES_RELEASE_EDITOR_LOCK"):
+            # 423: the Text editor holds the page locked. 412 can be the same
+            # editor: taking a lock changes the etag, so a page opened in the
+            # editor after it was read fails If-Match although its content is
+            # unchanged. Both re-read, and the content hash decides.
+            result = await _write_through_editor_lock(
+                client.webdav, path, page_id, content_bytes, expected_hash, conflict
             )
+            status_code = result.get("status_code")
+        elif status_code == 412:
+            raise ToolError(conflict)
+        elif status_code == 423:
+            raise _locked_error(page_id)
 
         return UpdatePageContentResponse(
             collective_id=collective_id,

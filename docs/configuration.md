@@ -1747,6 +1747,47 @@ rather than file paths.
 
 ---
 
+## Writing Collectives Pages That Are Open in the Editor (Optional)
+
+Nextcloud's Text editor locks a page's file (a `files_lock` app lock owned by
+`text`) whenever the page is open in Collectives, in preview as well as in edit
+mode. It releases the lock only when the editor closes cleanly. A closed or
+crashed tab can leave the lock behind for good
+([nextcloud/text#9042](https://github.com/nextcloud/text/issues/9042)). While the
+lock is held, `collectives_update_page_content` is refused with "locked".
+
+Set `COLLECTIVES_RELEASE_EDITOR_LOCK=true` to let the tool release that editor
+lock and write anyway:
+
+```bash
+COLLECTIVES_RELEASE_EDITOR_LOCK=true
+```
+
+### Behaviour
+
+1. The first write is refused with `423 Locked`, or with `412` when the editor
+   opened the page after it was read (taking a lock changes the etag).
+2. The tool reads the lock. Only the Text editor's lock is released (owner type
+   app, editor `text`). A lock a person set with "Lock file" is always
+   respected.
+3. Releasing a lock changes the file's etag, so the page is read again and its
+   content compared with the `content_hash` the caller read. A changed page is
+   refused as a conflict, exactly as without a lock.
+4. The page is written, conditional on the fresh etag.
+
+What users see (tested on Nextcloud 34, Text 8.0):
+
+| Page state at the time of the write | Result |
+|---|---|
+| closed, lock left behind | written |
+| open in preview | written, and the preview shows the new content |
+| open in edit mode, nobody typing | written, and the editor reloads the content |
+| open in edit mode, someone typing | written. The editor asks whether to keep the local or the remote version, and the other one stays in the version history |
+
+Releasing needs files_lock's permission to unlock the file, which the file's
+owner has. If the user may not release it, the tool reports that and writes
+nothing. Off by default.
+
 ## Loading Environment Variables
 
 After creating your `.env` file, load the environment variables:

@@ -204,6 +204,9 @@ services:
       - NEXTCLOUD_USERNAME=admin
       - NEXTCLOUD_PASSWORD=admin
       - NEXTCLOUD_PUBLIC_ISSUER_URL=http://localhost:8080
+      # Release the Text editor's lock on Collectives page updates
+      # (tests/server/test_collectives_mcp.py, nextcloud/text#9042).
+      - COLLECTIVES_RELEASE_EDITOR_LOCK=true
 
       # Pin the token DB inside the mcp-data volume so the runtime default
       # (ephemeral tempfile) doesn't silently apply inside containers.

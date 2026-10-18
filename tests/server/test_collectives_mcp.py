@@ -416,6 +416,58 @@ async def test_collectives_stale_page_etag_is_rejected(
         )
 
 
+async def test_collectives_update_writes_through_an_open_editor(
+    nc_mcp_client: ClientSession,
+    nc_client: NextcloudClient,
+    temporary_collective: dict,
+):
+    """An open editor view must not block collectives_update_page_content.
+
+    Text takes a files_lock lock on a page while any editor view of it is
+    open, preview included, and leaks it when a tab is closed abruptly
+    (nextcloud/text#9042). The integration ``mcp`` service sets
+    COLLECTIVES_RELEASE_EDITOR_LOCK, so the update releases that editor lock,
+    re-checks the content and writes. The session is opened through Text's
+    own API, exactly as the editor does, and deliberately never closed.
+    """
+    cid = temporary_collective["id"]
+    page_id = await _create_page(nc_mcp_client, temporary_collective)
+    try:
+        page = await _get_page(nc_mcp_client, cid, page_id)
+        path = _page_path(page["page"])
+
+        # A Collectives page ID is its file ID, which Text's session API takes.
+        opened = await nc_client.webdav._make_request(
+            "PUT",
+            f"/apps/text/session/{page_id}/create",
+            json={"fileId": page_id},
+            headers={"OCS-APIRequest": "true", "Accept": "application/json"},
+        )
+        assert opened.status_code == 200
+        lock = await nc_client.webdav.get_lock(path)
+        assert lock is not None and lock["editor"] == "text", lock
+
+        new_content = page["content"].rstrip("\n") + "\nWritten while open.\n"
+        update = await nc_mcp_client.call_tool(
+            "collectives_update_page_content",
+            {
+                "collective_id": cid,
+                "page_id": page_id,
+                "content": new_content,
+                "etag": page["etag"],
+                "content_hash": page["content_hash"],
+            },
+        )
+        assert update.is_error is False, update.content
+
+        after = await _get_page(nc_mcp_client, cid, page_id)
+        assert after["content"] == new_content
+    finally:
+        await nc_mcp_client.call_tool(
+            "collectives_trash_page", {"collective_id": cid, "page_id": page_id}
+        )
+
+
 async def test_collectives_move_page(
     nc_mcp_client: ClientSession, temporary_collective: dict
 ):
